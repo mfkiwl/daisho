@@ -12,3 +12,8 @@
 *.map
 *.srec
 .gdbinit
+_autosave*
+*.kicad_pcb-bak
+*.xml
+*gerber*
+*.brd-bak

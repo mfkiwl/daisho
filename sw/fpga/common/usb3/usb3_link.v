@@ -16,6 +16,7 @@ input	wire			reset_n,
 
 input	wire	[4:0]	ltssm_state,
 input	wire			ltssm_hot_reset,
+output	reg				ltssm_go_disabled,
 output	reg		[2:0]	ltssm_go_u,
 output	reg				ltssm_go_recovery,
 
@@ -30,7 +31,8 @@ output	reg				outp_active,
 input	wire			out_stall,
 
 // protocol interface
-input	wire	[1:0]	endp_mode,
+input	wire	[1:0]	endp_mode_rx,
+input	wire	[1:0]	endp_mode_tx,
 input	wire	[6:0]	dev_addr,
 
 output	reg				prot_rx_tp,
@@ -62,6 +64,7 @@ input	wire	[3:0]	prot_tx_tp_a_endp,
 input	wire	[4:0]	prot_tx_tp_a_nump,
 input	wire	[4:0]	prot_tx_tp_a_seq,
 input	wire	[15:0]	prot_tx_tp_a_stream,
+output	reg				prot_tx_tp_a_ack,
 
 input	wire			prot_tx_tp_b,
 input	wire			prot_tx_tp_b_retry,
@@ -71,6 +74,17 @@ input	wire	[3:0]	prot_tx_tp_b_endp,
 input	wire	[4:0]	prot_tx_tp_b_nump,
 input	wire	[4:0]	prot_tx_tp_b_seq,
 input	wire	[15:0]	prot_tx_tp_b_stream,
+output	reg				prot_tx_tp_b_ack,
+
+input	wire			prot_tx_tp_c,
+input	wire			prot_tx_tp_c_retry,
+input	wire			prot_tx_tp_c_dir,
+input	wire	[3:0]	prot_tx_tp_c_subtype,
+input	wire	[3:0]	prot_tx_tp_c_endp,
+input	wire	[4:0]	prot_tx_tp_c_nump,
+input	wire	[4:0]	prot_tx_tp_c_seq,
+input	wire	[15:0]	prot_tx_tp_c_stream,
+output	reg				prot_tx_tp_c_ack,
 
 input	wire			prot_tx_dph,
 input	wire			prot_tx_dph_eob,
@@ -78,6 +92,7 @@ input	wire			prot_tx_dph_dir,
 input	wire	[3:0]	prot_tx_dph_endp,
 input	wire	[4:0]	prot_tx_dph_seq,
 input	wire	[15:0]	prot_tx_dph_len,
+output	reg				prot_tx_dpp_ack,
 output	reg				prot_tx_dpp_done,
 
 
@@ -104,6 +119,9 @@ output	reg				err_stuck_hpseq,
 output	reg				err_lcmd_undefined,
 output	reg				err_lcrd_mismatch,
 output	reg				err_lgood_order,
+output	reg				err_lgood_missed,
+output	reg				err_pending_hp,
+output	reg				err_credit_hp,
 output	reg				err_hp_crc,
 output	reg				err_hp_seq,
 output	reg				err_hp_type,
@@ -198,6 +216,7 @@ parameter	[5:0]	LINK_QUEUE_RESET		= 'd0,
 					LINK_QUEUE_RTY_HP		= 'd9,
 					LINK_QUEUE_TP_A			= 'd10,
 					LINK_QUEUE_TP_B			= 'd11,
+					LINK_QUEUE_TP_C			= 'd13,
 					LINK_QUEUE_DP			= 'd12;
 						
 	reg		[4:0]	rd_hp_state;
@@ -253,7 +272,14 @@ parameter	[3:0]	WR_HP_RESET		= 'd0,
 	reg		[24:0]	pending_hp_timer;
 	reg		[24:0]	credit_hp_timer;
 	reg		[7:0]	link_error_count;
+	
 	reg				force_linkpm_accept;
+	reg		[24:0]	pm_lc_timer;									// not used unless this port initiates power modes (LGO_Ux)
+	reg		[24:0]	pm_entry_timer;		// new
+	reg		[24:0]	ux_exit_timer;		// new
+	reg				pm_waiting_for_ack;
+	
+	reg		[24:0]	port_config_timeout;
 	reg		[24:0]	T_PORT_U2_TIMEOUT;
 	
 	reg		[2:0]	tx_hdr_seq_num /* synthesis noprune */;			// Header Sequence Number (0-7)
@@ -262,11 +288,14 @@ parameter	[3:0]	WR_HP_RESET		= 'd0,
 	reg		[2:0]	rty_tx_hdr_seq_num /* synthesis noprune */;		// Retry Header Seq Num
 	reg		[2:0]	rx_hdr_seq_num /* synthesis noprune */;			// RX Header Seq Num
 	wire	[2:0]	rx_hdr_seq_num_dec = rx_hdr_seq_num - 3'h1;
+	reg				rx_hdr_seq_ignore;								// Ignoring HP between LBAD/LRTY
 	reg		[2:0]	local_rx_cred_count /* synthesis noprune */;	// Local RX Header Credit Count (0-4)
 	reg		[2:0]	remote_rx_cred_count /* synthesis noprune */;	// Remote RX Header Credit
+	reg				remote_rx_cred_count_inc;
+	reg				remote_rx_cred_count_dec;
 	reg		[1:0]	tx_cred_idx /* synthesis noprune */;	
 	reg		[1:0]	rx_cred_idx /* synthesis preserve */;
-	reg		[1:0]	poop;
+	reg		[1:0]	rx_cred_idx_cache;
 	reg		[26:0]	itp_value;
 	wire	[13:0]	bus_interval_count = itp_value[13:0];
 	
@@ -373,10 +402,11 @@ parameter	[3:0]	WR_HP_RESET		= 'd0,
 	
 	reg				tx_queue_open;
 	reg				tx_queue_lup;
-	reg		[2:0]	tx_queue_lcred;	// {strobe, CRD_A-CRD_D[1:0]
-	reg		[3:0]	tx_queue_lgood;	// {strobe, GOOD_0-GOOD_3[2:0]
+	reg		[2:0]	tx_queue_lcred;	// {strobe, CRD_A-CRD_D[1:0]}
+	reg		[3:0]	tx_queue_lgood;	// {strobe, GOOD_0-GOOD_3[2:0]}
 	
 	reg				send_port_cfg_resp;
+	reg		[1:0]	recv_port_cmdcfg;
 	
 	reg		[9:0]	qc;		// queue counter
 	reg				queue_send_u0_adv;
@@ -441,11 +471,22 @@ always @(posedge local_clk) begin
 	
 	prot_rx_tp <= 0;
 	prot_rx_dph <= 0;
+	prot_tx_tp_a_ack <= 0;
+	prot_tx_tp_b_ack <= 0;
+	prot_tx_tp_c_ack <= 0;
+	prot_tx_dpp_ack <= 0;
 	
 	if(in_data == 32'h0) `INC(dc);
 	`INC(rc);
 	`INC(sc);
 		
+	// atomic increment/decrement
+	remote_rx_cred_count_inc <= 0;
+	remote_rx_cred_count_dec <= 0;
+	remote_rx_cred_count <= remote_rx_cred_count + 
+							(remote_rx_cred_count_inc ? 1 : 0) - 
+							(remote_rx_cred_count_dec ? 1 : 0);
+							
 	// detect LTSSM change
 	if(ltssm_last != ltssm_state) begin
 		ltssm_changed <= 1;
@@ -462,6 +503,9 @@ always @(posedge local_clk) begin
 	LT_U0: begin
 		`INC(pending_hp_timer);
 		`INC(credit_hp_timer);
+		`INC(pm_entry_timer);
+		`INC(ux_exit_timer);
+		`INC(port_config_timeout);
 		
 		// increment U0LTimeout up to its triggering amount (10uS)
 		// shall be reset when sending any data, paused then restarted upon idle re-entry
@@ -488,9 +532,61 @@ always @(posedge local_clk) begin
 		
 		u2_timeout <= 0;
 		
-		// disable CREDIT_HP_TIMER if no header packets
-		// were sent and still unparsed
+		
+		// run CREDIT_HP_TIMER if any header packets are pending re-credit
 		if(remote_rx_cred_count == 4) credit_hp_timer <= 0;
+		if(credit_hp_timer == T_CREDIT_HP) begin
+			// stall until any header packet finished sending
+			credit_hp_timer <= T_CREDIT_HP;
+			if(wr_hp_state == WR_HP_IDLE) begin
+				// tell LTSSM to transition to Recovery
+				err_credit_hp <= 1;
+				ltssm_go_recovery <= 1;
+			end
+		end
+		
+		// run PENDING_HP_TIMER if any sent HP were lost, and U0 Adv. is done
+		if(remote_rx_cred_count == 4 && recv_u0_adv) pending_hp_timer <= 0;
+		if(pending_hp_timer == T_PENDING_HP) begin
+			// stall until any header packet finished sending
+			pending_hp_timer <= T_PENDING_HP;
+			if(wr_hp_state == WR_HP_IDLE) begin
+				// tell LTSSM to transition to Recovery
+				err_pending_hp <= 1;
+				ltssm_go_recovery <= 1;
+			end
+		end
+		
+		// run PM_LC_TIMER
+		// TODO only needed if device requests PM changes (unlikely)
+		
+		// run PM_ENTRY_TIMER
+		if(!pm_waiting_for_ack) pm_entry_timer <= 0;
+		if(pm_entry_timer == T_PM_ENTRY) begin
+			pm_entry_timer <= T_PM_ENTRY;
+			// we never received any LPMA, but did accept a link PM change, so
+			// just assume LPMA was lost and proceed to the new state anyway
+			if(pm_waiting_for_ack) begin
+				// desired PM state is stored in ltssm_go_u[1:0]
+				ltssm_go_u[2] <= 1'b1;
+				pm_waiting_for_ack <= 0;
+			end
+		end
+		
+		// run Ux_EXIT_TIMER
+		// TODO
+		
+		// run tPortConfiguration timeout
+		if(recv_port_cmdcfg == 2'b11) port_config_timeout <= 0;
+		if(port_config_timeout == T_PORT_CONFIG) begin
+			port_config_timeout <= T_PORT_CONFIG;
+			if(recv_port_cmdcfg != 2'b11) begin
+				// timer has run out and Port Capability LMP/Port Config LMP were not
+				// exchanged properly. As we are an upstream port (device) then goto
+				// SS.Disabled.
+				ltssm_go_disabled <= 1;
+			end
+		end
 	end
 	LT_U1: begin
 		// U2 entry timer, if we stay here in U1 too long this boots us to U2
@@ -501,7 +597,19 @@ always @(posedge local_clk) begin
 		if(u2_timeout == T_PORT_U2_TIMEOUT)
 			ltssm_go_u[2:0] <= {1'b1, 2'd2};
 	end
-	default: begin  end
+	default: begin  
+		// reset timeouts
+		u0l_timeout <= 0;
+		u0_recovery_timeout <= 0;
+		pending_hp_timer <= 0;
+		credit_hp_timer <= 0;
+		pm_lc_timer <= 0;
+		pm_entry_timer <= 0;
+		ux_exit_timer <= 0;
+		port_config_timeout <= 0;
+		
+		ltssm_go_disabled <= 0;
+	end
 	endcase
 	
 	if(ltssm_state != LT_U0) begin
@@ -531,6 +639,7 @@ always @(posedge local_clk) begin
 				// only reset these in inital U0 entry or Hot Reset, lose state
 				tx_hdr_seq_num <= 0;
 				rx_hdr_seq_num <= 0;
+				rx_hdr_seq_ignore <= 0;
 				queue_hp_retry <= 0;
 				rty_tx_hdr_seq_num <= 0;
 				last_hdr_seq_num <= 7;
@@ -550,6 +659,10 @@ always @(posedge local_clk) begin
 			if(ltssm_stored == LT_POLLING_IDLE || ltssm_stored == LT_HOTRESET_EXIT) begin
 				// initiate port capabilities
 				queue_send_u0_portcap <= 1;
+				// expect to receive portcap/portcfg
+				recv_port_cmdcfg <= 2'h0;
+			end else begin
+				//recv_port_cmdcfg == 2'b11;
 			end
 			queue_send_u0_adv <= 1;
 			
@@ -560,13 +673,10 @@ always @(posedge local_clk) begin
 			rx_cred_idx <= 0; // A
 			remote_rx_cred_count <= 0;
 			// reset timers
-			pending_hp_timer <= 0;
-			credit_hp_timer <= 0;
-			u0l_timeout <= 0;
-			u0_recovery_timeout <= 0;
 			dc <= 0;
 			// reset flags
 			force_linkpm_accept <= 0;
+			pm_waiting_for_ack <= 0;
 			tx_queue_lup <= 0;
 			tx_queue_lcred <= 0;
 			tx_queue_lgood <= 0;
@@ -574,6 +684,7 @@ always @(posedge local_clk) begin
 			tx_lcmd_act <= 0;
 			tx_lcmd_queue <= 0; ///////
 			send_port_cfg_resp <= 0;
+			
 			// upon sending of first header packet, the remote rx hdr cred count
 			// should be decremented
 			out_header_first_since_entry <= 1;
@@ -585,6 +696,11 @@ always @(posedge local_clk) begin
 			check_hp_state <= CHECK_HP_RESET;
 		end
 		LT_RECOVERY_IDLE: begin
+			// we can de-assert the recovery signal now
+			ltssm_go_recovery <= 0;
+			rx_hdr_seq_ignore <= 0;
+		end
+		default: begin
 			// we can de-assert the recovery signal now
 			ltssm_go_recovery <= 0;
 		end
@@ -612,7 +728,7 @@ always @(posedge local_clk) begin
 				recv_state <= LINK_RECV_CMDW_0;
 			end
 			
-			if({in_data, in_datak, in_active} == {32'hFBFBFBF7, 4'b1111, 1'b1}) begin
+			if({in_data, in_datak} == {32'hFBFBFBF7, 4'b1111}) begin
 				// HPSTART ordered set
 				rc <= 0;
 				crc_hprx_rst <= 1;
@@ -645,7 +761,11 @@ always @(posedge local_clk) begin
 			// so that we can start parsing on the very next cycle
 			recv_state <= LINK_RECV_IDLE;
 			
-			check_hp_state <= CHECK_HP_0;
+			// only bother parsing if no header packet error was seen earlier
+			// note: cycle delays to HP parse must be consistent
+			if(!rx_hdr_seq_ignore) begin
+				check_hp_state <= CHECK_HP_0;
+			end
 		end
 	end
 	LINK_RECV_CMDW_0: begin
@@ -683,20 +803,26 @@ always @(posedge local_clk) begin
 			{LCMD_LGOOD_6, 1'b1}: ack_tx_hdr_seq_num <= 7;
 			{LCMD_LGOOD_7, 1'b1}: ack_tx_hdr_seq_num <= 0;
 			{LCMD_LCRD_A, 1'b1}: begin 
-				`INC(remote_rx_cred_count); 
+				//`INC(remote_rx_cred_count); 
+				remote_rx_cred_count_inc <= 1;
 				`INC(rx_cred_idx);
 			end
 			{LCMD_LCRD_B, 1'b1}: begin 
-				`INC(remote_rx_cred_count); 
+				//`INC(remote_rx_cred_count); 
+				remote_rx_cred_count_inc <= 1;
 				`INC(rx_cred_idx);
 			end
 			{LCMD_LCRD_C, 1'b1}: begin 
-				`INC(remote_rx_cred_count); 
+				//`INC(remote_rx_cred_count); 
+				remote_rx_cred_count_inc <= 1;
 				`INC(rx_cred_idx);
 			end
 			{LCMD_LCRD_D, 1'b1}: begin 
-				`INC(remote_rx_cred_count); 
+				//`INC(remote_rx_cred_count); 
+				remote_rx_cred_count_inc <= 1;
 				`INC(rx_cred_idx);
+				pending_hp_timer <= 0;
+				credit_hp_timer <= 0;
 				recv_u0_adv <= 1;
 				expect_state <= LINK_EXPECT_IDLE;
 			end
@@ -769,7 +895,7 @@ always @(posedge local_clk) begin
 		if(in_dpp_crc32 == crc_dpprx32_out) begin
 			// match
 			prot_rx_dpp_crcgood <= 1;
-			buf_in_commit <= 1; //TODO move commits to protocol layer
+			buf_in_commit <= 1; // TODO move commits to protocol layer
 		end else begin
 			// fail
 			prot_rx_dpp_crcgood <= 1;
@@ -782,7 +908,7 @@ always @(posedge local_clk) begin
 	
 	//
 	// Check Header Packet FSM
-	//
+	// 
 	case(check_hp_state)
 	CHECK_HP_RESET: check_hp_state <= CHECK_HP_IDLE;
 	CHECK_HP_IDLE: begin
@@ -812,6 +938,7 @@ always @(posedge local_clk) begin
 			tx_lcmd_act <= 1;
 			err_hp_crc <= 1;
 			`INC(in_header_err_count);
+			rx_hdr_seq_ignore <= 1;
 			check_hp_state <= CHECK_HP_IDLE;
 			//`INC(rx_hdr_seq_num); /// NOPE
 			//`INC(rx_cred_idx); // NOPE AS WELL
@@ -831,7 +958,7 @@ always @(posedge local_clk) begin
 		`INC(rx_hdr_seq_num);
 		// set dirty bit in queue, cause HP to be parsed by next FSM
 		in_header_pkt_queued[3-rx_cred_idx] <= 1;
-		poop <= rx_cred_idx;
+		rx_cred_idx_cache <= rx_cred_idx;
 		`INC(rx_cred_idx); // TOOD ORKRDSR?
 		// send LGOOD
 		tx_queue_lgood <= {1'b1, rx_hdr_seq_num[2:0]};
@@ -845,7 +972,7 @@ always @(posedge local_clk) begin
 	case(rd_hp_state)
 	RD_HP_RESET: rd_hp_state <= RD_HP_IDLE;
 	RD_HP_IDLE: begin
-		case(poop)
+		case(rx_cred_idx_cache)
 		0: begin
 			if(in_header_pkt_queued[3]) in_header_pkt_pick <= 3; else
 			if(in_header_pkt_queued[2]) in_header_pkt_pick <= 2; else
@@ -877,9 +1004,16 @@ always @(posedge local_clk) begin
 			LP_LMP_SUB_SETLINK: force_linkpm_accept <= in_header_pkt_mux[10];
 			LP_LMP_SUB_U2INACT: T_PORT_U2_TIMEOUT <= in_header_pkt_mux[16:9] * 32000; // 256 uS units
 			LP_LMP_SUB_VENDTEST: begin end
-			LP_LMP_SUB_PORTCAP: begin end
-			LP_LMP_SUB_PORTCFG: send_port_cfg_resp <= 1;
-			LP_LMP_SUB_PORTCFGRSP:  begin end
+			LP_LMP_SUB_PORTCAP: begin 
+				recv_port_cmdcfg[1] <= 1'b1;
+			end
+			LP_LMP_SUB_PORTCFG: begin
+				send_port_cfg_resp <= 1;
+				recv_port_cmdcfg[0] <= 1'b1;
+			end
+			LP_LMP_SUB_PORTCFGRSP: begin 
+				
+			end
 			endcase		
 		end
 		LP_TYPE_TP: begin
@@ -917,7 +1051,7 @@ always @(posedge local_clk) begin
 		endcase
 		
 		in_header_pkt_queued[in_header_pkt_pick] <= 0;
-		tx_queue_lcred[2:0] <= {1'b1, poop[1:0]};
+		tx_queue_lcred[2:0] <= {1'b1, rx_cred_idx_cache[1:0]};
 		`INC(local_rx_cred_count);
 		//`INC(rx_cred_idx);
 		rd_hp_state <= RD_HP_IDLE;
@@ -961,7 +1095,7 @@ always @(posedge local_clk) begin
 				ltssm_go_recovery <= 1;
 			end else begin
 				`INC(ack_tx_hdr_seq_num);
-				`INC(tx_hdr_seq_num);
+				//`INC(tx_hdr_seq_num);
 				pending_hp_timer <= 0;
 			end
 			
@@ -976,29 +1110,37 @@ always @(posedge local_clk) begin
 				// out of sequence
 				err_lcrd_mismatch <= 1;
 				ltssm_go_recovery <= 1;
+			end else if (0) begin // TODO DETECT LCRD WTHIOUT LGOOD
+				err_lgood_missed <= 1;
+				ltssm_go_recovery <= 1;
 			end else begin
 				`INC(tx_cred_idx);
-				`INC(remote_rx_cred_count);
+				//`INC(remote_rx_cred_count); 
+				remote_rx_cred_count_inc <= 1;
 				credit_hp_timer <= 0;
 			end
 		end else
 		if(rx_lcmd[10:2] == LCMD_LGO_U1[10:2]) begin
 			// LGO_x, latch U1,U2,U3
 			ltssm_go_u[1:0] <= rx_lcmd[1:0];
-			if(rx_lcmd[1:0] == 2'b11 || local_rx_cred_count < 4 && !force_linkpm_accept) 
-				// reject if U3 or not enough credits
+			if(local_rx_cred_count < 4 && !force_linkpm_accept) begin // rx_lcmd[1:0] == 2'b11 || 
+				// reject if not enough credits
 				tx_lcmd <= LCMD_LXU;
-			else
+			end else begin
 				tx_lcmd <= LCMD_LAU;	// TODO stall until packet's done if necessary
+				pm_waiting_for_ack <= 1;
+			end
 			tx_lcmd_act <= 1;
 		end else
 		if(rx_lcmd == LCMD_LPMA) begin
-			// Host acknolwedged our acceptance of new power state
+			// Host acknowledged our acceptance of new power state
 			ltssm_go_u[2] <= 1'b1;
+			pm_waiting_for_ack <= 0;
 		end else
 		if(rx_lcmd == LCMD_LRTY) begin
-			// TODO
 			// re-receive header packet
+			// we've been ignoring all header packets since the error, but now start listening
+			rx_hdr_seq_ignore <= 0;
 		end else
 		if(rx_lcmd == LCMD_LBAD) begin
 			// re-send all un-acknowledged header packets
@@ -1022,7 +1164,7 @@ always @(posedge local_clk) begin
 		if(queue_send_u0_adv && (recv_u0_adv||1) && dc > 1) begin
 			queue_state <= LINK_QUEUE_HDR_SEQ_AD;
 			queue_send_u0_adv <= 0;
-		end else if(!tx_hp_do) begin
+		end else if( send_state == LINK_SEND_IDLE && !tx_hp_do) begin // 
 			// send Port Capability HP once advertisement is finished
 			if(queue_send_u0_portcap && sent_u0_adv) begin
 				queue_state <= LINK_QUEUE_PORTCAP;
@@ -1039,6 +1181,10 @@ always @(posedge local_clk) begin
 			// retry HP send
 			if(queue_hp_retry) begin
 				queue_state <= LINK_QUEUE_RTY_HP;
+			end else
+			// send TP from Protocol Layer C
+			if(prot_tx_tp_c) begin
+				queue_state <= LINK_QUEUE_TP_C;
 			end else
 			// send TP from Protocol Layer B
 			if(prot_tx_tp_b) begin
@@ -1135,6 +1281,7 @@ always @(posedge local_clk) begin
 							1'b0, 3'h0, prot_tx_tp_a_endp, prot_tx_tp_a_dir, prot_tx_tp_a_retry, 2'h0, prot_tx_tp_a_subtype};
 		tx_hp_word_2 <= {	LP_TP_NBI_0, LP_TP_PPEND_NO, LP_TP_DBI_NO, LP_TP_WPA_NO, LP_TP_SSI_NO, 8'h0, prot_tx_tp_a_stream};
 		tx_hp_act <= 1;
+		prot_tx_tp_a_ack <= 1;
 		queue_state <= LINK_QUEUE_IDLE;
 	end
 	LINK_QUEUE_TP_B: begin
@@ -1144,19 +1291,33 @@ always @(posedge local_clk) begin
 		tx_hp_word_2 <= {	LP_TP_NBI_0, LP_TP_PPEND_NO, LP_TP_DBI_NO, LP_TP_WPA_NO, LP_TP_SSI_NO, 8'h0, prot_tx_tp_b_stream};
 		tx_hp_act <= 1;
 		local_dev_addr <= dev_addr;
+		prot_tx_tp_b_ack <= 1;
+		queue_state <= LINK_QUEUE_IDLE;
+	end
+	LINK_QUEUE_TP_C: begin
+		tx_hp_word_0 <= {	local_dev_addr, LP_TP_ROUTE0, LP_TYPE_TP};
+		tx_hp_word_1 <= {	6'h0, prot_tx_tp_c_seq, prot_tx_tp_c_nump, 
+							1'b0, 3'h0, prot_tx_tp_c_endp, prot_tx_tp_c_dir, prot_tx_tp_c_retry, 2'h0, prot_tx_tp_c_subtype};
+		tx_hp_word_2 <= {	LP_TP_NBI_0, LP_TP_PPEND_NO, LP_TP_DBI_NO, LP_TP_WPA_NO, LP_TP_SSI_NO, 8'h0, prot_tx_tp_c_stream};
+		tx_hp_act <= 1;
+		local_dev_addr <= dev_addr;
+		prot_tx_tp_c_ack <= 1;
 		queue_state <= LINK_QUEUE_IDLE;
 	end
 	LINK_QUEUE_DP: begin
 		case(qc)
 		0: begin
+			if(send_state == LINK_SEND_IDLE) begin
 			tx_hp_word_0 <= {	local_dev_addr, LP_TP_ROUTE0, LP_TYPE_DP};
 			tx_hp_word_1 <= {	prot_tx_dph_len, 1'b0, 3'b0, prot_tx_dph_endp, prot_tx_dph_dir, prot_tx_dph_eob, 1'b0, prot_tx_dph_seq};
 			tx_hp_word_2 <= {	32'h0};
 			tx_hp_act <= 1;
 			tx_hp_dph <= 1;
 			out_dpp_length <= prot_tx_dph_len;
+			prot_tx_dpp_ack <= 1;
 			prot_tx_dpp_done <= 0;
 			qc <= 1;
+			end
 		end
 		1: begin
 			queue_state <= LINK_QUEUE_IDLE;
@@ -1185,8 +1346,10 @@ always @(posedge local_clk) begin
 			tx_queue_open <= 0;
 		end
 		
-		if(ltssm_state != LT_U0) begin
+		if(ltssm_state != LT_U0 || (pm_waiting_for_ack && tx_lcmd != LCMD_LAU)) begin
 			// freeze until U0
+			// don't send any packets or commands while waiting on LPMA
+			// but do allow LAU to be sent
 			tx_queue_open <= 0;
 		end else
 		if(tx_lcmd_do) begin
@@ -1313,7 +1476,9 @@ always @(posedge local_clk) begin
 	end
 	WR_HP_0: begin
 		crc_hptx_rst <= 1;
-		if(!tx_hp_retry) `DEC(remote_rx_cred_count);
+		if(!tx_hp_retry) remote_rx_cred_count_dec <= 1;
+			//`DEC(remote_rx_cred_count);
+
 		{out_data_2, out_datak_2} <= {32'hFBFBFBF7, 4'b1111};	// HPSTART ordered set
 		out_active_2 <= 1;
 		sc <= 0;
@@ -1348,9 +1513,9 @@ always @(posedge local_clk) begin
 	end
 	WR_HP_4: begin
 		// TODO only increment if this wasn't a RETRY
-		//if(!tx_hp_retry) `INC(tx_hdr_seq_num);
+		if(!tx_hp_retry) `INC(tx_hdr_seq_num);
 		if(out_header_first_since_entry) begin
-			//remote_rx_cred_count <= remote_rx_cred_count - 1'b1;
+			//remote_rx_cred_count_dec <= 1;
 			out_header_first_since_entry <= 0;
 		end
 		if(tx_hp_dph) begin
@@ -1363,6 +1528,7 @@ always @(posedge local_clk) begin
 	WR_HP_5: begin
 		// wait for DPP write to complete
 		if(write_dpp_state == WRITE_DPP_IDLE) begin
+			buf_out_arm <= 1;
 			tx_hp_done <= 1;
 			prot_tx_dpp_done <= 1;
 			wr_hp_state <= WR_HP_IDLE;
@@ -1373,7 +1539,7 @@ always @(posedge local_clk) begin
 	//
 	// Write Data Packet Payload FSM
 	//
-	// this is an abortion, will be dealt with at earliest opportunity
+	// TODO refactor into fewer states
 	//
 	case(write_dpp_state)
 	WRITE_DPP_RESET: write_dpp_state <= WRITE_DPP_IDLE;
@@ -1484,8 +1650,9 @@ always @(posedge local_clk) begin
 		{out_data, out_datak, out_active} <= {32'hF7000000, 4'b1000, 1'b1}; write_dpp_state <= WRITE_DPP_3;
 	end
 	endcase
+
 	
- 
+	
 	if(~reset_n) begin
 		send_state <= LINK_SEND_RESET;
 		recv_state <= LINK_RECV_RESET;
@@ -1500,6 +1667,9 @@ always @(posedge local_clk) begin
 		err_lcmd_undefined <= 0;
 		err_lcrd_mismatch <= 0;
 		err_lgood_order <= 0;
+		err_lgood_missed <= 0;
+		err_pending_hp <= 0;
+		err_credit_hp <= 0;
 		err_hp_crc <= 0;
 		err_hp_seq <= 0;
 		err_hp_type <= 0;
@@ -1529,6 +1699,11 @@ end
 //
 // CRC-32 of Data Packet Payloads
 //
+	//wire	[31:0]	crc_dpprx_out = (in_dpp_length_remain_1 == 4) ? (swap32(crc_dpprx32_out)) :
+	//								(in_dpp_length_remain_1 == 3) ? (swap32(crc_dpprx24_out)) :
+	//								(in_dpp_length_remain_1 == 2) ? (swap32(crc_dpprx16_out)) :
+	//								(in_dpp_length_remain_1 == 1) ? (swap32(crc_dpprx8_out)) : (swap32(crc_dpprx32_out));
+									// TODO FIXUP FOR RX
 	wire	[31:0]	crc_dpprx_q;
 	reg				crc_dpprx_rst;
 	reg		[31:0]	crc_dpprx_in;
